@@ -5,9 +5,8 @@
 //! Handler for the `tauri://` custom protocol, serving bundled app assets
 //! in production and proxying to the dev server on mobile during development.
 
-use std::borrow::Cow;
-
 use http::{Request, Response as HttpResponse, StatusCode, header::CONTENT_TYPE};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
 use tauri_utils::config::HeaderAddition;
 
 use crate::{
@@ -17,7 +16,9 @@ use crate::{
 };
 
 #[cfg(all(dev, mobile))]
-use std::{collections::HashMap, sync::Mutex};
+use std::collections::HashMap;
+#[cfg(all(dev, mobile))]
+use tokio::sync::Mutex;
 
 #[cfg(all(dev, mobile))]
 #[derive(Clone)]
@@ -32,59 +33,119 @@ struct CachedResponse {
 /// This handler serves your app's bundled assets (HTML, JS, CSS, etc.) in production,
 /// and proxies requests to the dev server on mobile during development.
 pub fn get<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
-  #[allow(unused_variables)] manager: M,
+  manager: M,
   window_origin: &str,
   web_resource_request_handler: Option<Box<WebResourceRequestHandler>>,
 ) -> UriSchemeProtocolHandler {
-  #[cfg(all(dev, mobile))]
-  let url = {
-    let mut url = manager
-      .manager()
-      .get_app_url(window_origin.starts_with("https"))
-      .as_str()
-      .to_string();
-    if url.ends_with('/') {
-      url.pop();
-    }
-    url
-  };
-
-  let window_origin = window_origin.to_string();
-
-  #[cfg(all(dev, mobile))]
-  let response_cache = std::sync::Arc::new(Mutex::new(HashMap::new()));
-
-  Box::new(move |_, request, responder| {
-    match get_response(
-      request,
-      &manager,
-      &window_origin,
-      web_resource_request_handler.as_deref(),
-      #[cfg(all(dev, mobile))]
-      (&url, &response_cache),
-    ) {
-      Ok(response) => responder.respond(response),
-      Err(e) => responder.respond(
-        HttpResponse::builder()
-          .status(StatusCode::INTERNAL_SERVER_ERROR)
-          .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
-          .header("Access-Control-Allow-Origin", &window_origin)
-          .body(e.to_string().into_bytes())
-          .unwrap(),
-      ),
-    }
-  })
+  let responder = RequestCallbackBuilder::new(manager, window_origin, web_resource_request_handler);
+  Arc::new(responder).into_callback()
 }
 
-fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
+struct RequestCallbackBuilder<M, R> {
+  manager: M,
+  window_origin: String,
+  web_resource_request_handler: Option<Box<WebResourceRequestHandler>>,
+  #[cfg(all(dev, mobile))]
+  url: String,
+  #[cfg(all(dev, mobile))]
+  response_cache: Mutex<HashMap<String, CachedResponse>>,
+  runtime: PhantomData<fn() -> R>,
+}
+
+impl<M, R> RequestCallbackBuilder<M, R>
+where
+  M: Manager<R> + Send + Sync + 'static,
+  R: Runtime,
+{
+  fn new(
+    manager: M,
+    window_origin: &str,
+    web_resource_request_handler: Option<Box<WebResourceRequestHandler>>,
+  ) -> Self {
+    #[cfg(all(dev, mobile))]
+    let response_cache = Mutex::new(HashMap::new());
+
+    #[cfg(all(dev, mobile))]
+    let url = {
+      let mut url = manager
+        .manager()
+        .get_app_url(window_origin.starts_with("https"))
+        .as_str()
+        .to_string();
+      if url.ends_with('/') {
+        url.pop();
+      }
+      url.into()
+    };
+
+    Self {
+      manager,
+      window_origin: window_origin.into(),
+      web_resource_request_handler,
+      #[cfg(all(dev, mobile))]
+      url,
+      #[cfg(all(dev, mobile))]
+      response_cache,
+      runtime: PhantomData,
+    }
+  }
+
+  fn into_callback(self: Arc<Self>) -> UriSchemeProtocolHandler {
+    Box::new(move |_, request, responder| {
+      let this = self.clone();
+      crate::async_runtime::spawn(async move {
+        let RequestCallbackBuilder {
+          manager,
+          window_origin,
+          web_resource_request_handler,
+          #[cfg(all(dev, mobile))]
+          url,
+          #[cfg(all(dev, mobile))]
+          response_cache,
+          ..
+        } = &*this;
+
+        let resp_fut = get_response(
+          request,
+          manager,
+          window_origin.as_str(),
+          web_resource_request_handler.as_deref(),
+          #[cfg(all(dev, mobile))]
+          (url.as_str(), response_cache),
+        );
+
+        let timeout_fut = tokio::time::timeout(Duration::from_secs(10), resp_fut);
+
+        match timeout_fut.await {
+          Ok(Ok(response)) => responder.respond(response),
+          Ok(Err(e)) => responder.respond(
+            HttpResponse::builder()
+              .status(StatusCode::INTERNAL_SERVER_ERROR)
+              .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
+              .header("Access-Control-Allow-Origin", window_origin.as_str())
+              .body(e.to_string().into_bytes())
+              .unwrap(),
+          ),
+          Err(e) => responder.respond(
+            HttpResponse::builder()
+              .status(StatusCode::REQUEST_TIMEOUT)
+              .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
+              .header("Access-Control-Allow-Origin", window_origin.as_str())
+              .body(e.to_string().into_bytes())
+              .unwrap(),
+          ),
+        }
+      });
+    })
+  }
+}
+
+async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
   #[allow(unused_mut)] mut request: Request<Vec<u8>>,
   #[allow(unused_variables)] manager: &M,
   window_origin: &str,
   web_resource_request_handler: Option<&WebResourceRequestHandler>,
-  #[cfg(all(dev, mobile))] (url, response_cache): (
-    &str,
-    &std::sync::Arc<Mutex<HashMap<String, CachedResponse>>>,
-  ),
+  #[cfg(all(dev, mobile))] (url, response_cache): (&str, &Mutex<HashMap<String, CachedResponse>>),
 ) -> Result<HttpResponse<Cow<'static, [u8]>>, Box<dyn std::error::Error>> {
   // use the entire URI as we are going to proxy the request
   let path = if PROXY_DEV_SERVER {
@@ -170,9 +231,9 @@ fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
       proxy_builder = proxy_builder.header(name, value);
     }
     proxy_builder = proxy_builder.body(request.body().clone());
-    match crate::async_runtime::safe_block_on(proxy_builder.send()) {
+    match proxy_builder.send().await {
       Ok(r) => {
-        let mut response_cache_ = response_cache.lock().unwrap();
+        let mut response_cache_ = response_cache.lock().await;
         let mut response = None;
         if r.status() == http::StatusCode::NOT_MODIFIED {
           response = response_cache_.get(&url);
@@ -182,7 +243,7 @@ fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
         } else {
           let status = r.status();
           let headers = r.headers().clone();
-          let body = crate::async_runtime::safe_block_on(r.bytes())?;
+          let body = r.bytes().await?;
           let response = CachedResponse {
             status,
             headers,
