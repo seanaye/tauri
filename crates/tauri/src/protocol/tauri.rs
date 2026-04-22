@@ -114,21 +114,11 @@ where
           (url.as_str(), response_cache),
         );
 
-        let timeout_fut = tokio::time::timeout(Duration::from_secs(10), resp_fut);
-
-        match timeout_fut.await {
-          Ok(Ok(response)) => responder.respond(response),
-          Ok(Err(e)) => responder.respond(
-            HttpResponse::builder()
-              .status(StatusCode::INTERNAL_SERVER_ERROR)
-              .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
-              .header("Access-Control-Allow-Origin", window_origin.as_str())
-              .body(e.to_string().into_bytes())
-              .unwrap(),
-          ),
+        match resp_fut.await {
+          Ok(response) => responder.respond(response),
           Err(e) => responder.respond(
             HttpResponse::builder()
-              .status(StatusCode::REQUEST_TIMEOUT)
+              .status(StatusCode::INTERNAL_SERVER_ERROR)
               .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
               .header("Access-Control-Allow-Origin", window_origin.as_str())
               .body(e.to_string().into_bytes())
