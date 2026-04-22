@@ -1,0 +1,4 @@
+[language-server.rust-analyzer.config.cargo]
+# allFeatures = true enables custom-protocol, which disables the dev cfg.
+# Use default features instead so the build script sets dev = true.
+allFeatures = false
