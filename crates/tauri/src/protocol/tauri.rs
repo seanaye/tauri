@@ -5,14 +5,14 @@
 //! Handler for the `tauri://` custom protocol, serving bundled app assets
 //! in production and proxying to the dev server on mobile during development.
 
-use http::{Request, Response as HttpResponse, StatusCode, header::CONTENT_TYPE};
-use std::{borrow::Cow, error::Error as StdError, marker::PhantomData, sync::Arc, time::Duration};
+use http::{header::CONTENT_TYPE, Request, Response as HttpResponse, StatusCode};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
 use tauri_utils::config::HeaderAddition;
 
 use crate::{
-  Manager, Runtime,
   manager::webview::PROXY_DEV_SERVER,
   webview::{UriSchemeProtocolHandler, WebResourceRequestHandler},
+  Manager, Runtime,
 };
 
 #[cfg(all(dev, mobile))]
@@ -122,10 +122,7 @@ where
         }
       }
 
-      builder
-        .pool_max_idle_per_host(6)
-        .build()
-        .unwrap()
+      builder.pool_max_idle_per_host(6).build().unwrap()
     };
 
     Self {
@@ -204,7 +201,11 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
   #[allow(unused_variables)] manager: &M,
   window_origin: &str,
   web_resource_request_handler: Option<&WebResourceRequestHandler>,
-  #[cfg(all(dev, mobile))] (url, response_cache, client): (&str, &Mutex<HashMap<String, CachedResponse>>, &reqwest::Client),
+  #[cfg(all(dev, mobile))] (url, response_cache, client): (
+    &str,
+    &Mutex<HashMap<String, CachedResponse>>,
+    &reqwest::Client,
+  ),
 ) -> Result<HttpResponse<Cow<'static, [u8]>>, Box<dyn std::error::Error>> {
   // use the entire URI as we are going to proxy the request
   let path = if PROXY_DEV_SERVER {
@@ -242,8 +243,7 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
       decoded_path.trim_start_matches('/')
     );
 
-    let mut proxy_builder = client
-      .request(request.method().clone(), &url);
+    let mut proxy_builder = client.request(request.method().clone(), &url);
     proxy_builder = proxy_builder.body(std::mem::take(request.body_mut()));
     for (name, value) in request.headers() {
       proxy_builder = proxy_builder.header(name, value);
@@ -278,22 +278,24 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
           .body(response.body.to_vec().into())?
       }
       Err(e) => {
-        let is_connect = e.is_connect();
-        let is_timeout = e.is_timeout();
-        let is_request = e.is_request();
         let source_chain = {
           let mut chain = Vec::new();
-          let mut source: Option<&dyn StdError> = StdError::source(&e);
+          let mut source: Option<&dyn std::error::Error> = std::error::Error::source(&e);
           while let Some(s) = source {
             chain.push(format!("{s}"));
             source = s.source();
           }
           chain.join(" -> ")
         };
-        let error_message = format!(
-          "Failed to request {url}: {e} [connect={is_connect}, timeout={is_timeout}, request={is_request}, thread={:?}, sources: {source_chain}]",
-          std::thread::current().name(),
-        );
+        let hint = if let Some(s) = e.status() {
+          format!(", status code: {}", s.as_u16())
+        } else if cfg!(target_os = "ios") && (e.is_connect() || e.is_timeout()) {
+          ", did you grant local network permissions? That is required to reach the development server. Please grant the permission via the prompt or in `Settings > Privacy & Security > Local Network` and restart the app. See https://support.apple.com/en-us/102229 for more information.".to_string()
+        } else {
+          String::new()
+        };
+        let error_message =
+          format!("Failed to request {url}: {e}{hint} [sources: {source_chain}]",);
         log::error!("{error_message}");
         return Err(error_message.into());
       }
