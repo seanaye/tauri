@@ -49,6 +49,10 @@ struct RequestCallbackBuilder<M, R> {
   url: String,
   #[cfg(all(dev, mobile))]
   response_cache: Mutex<HashMap<String, CachedResponse>>,
+  #[cfg(all(dev, mobile))]
+  client: reqwest::Client,
+  #[cfg(all(dev, mobile))]
+  semaphore: tokio::sync::Semaphore,
   runtime: PhantomData<fn() -> R>,
 }
 
@@ -75,7 +79,53 @@ where
       if url.ends_with('/') {
         url.pop();
       }
-      url.into()
+      url
+    };
+
+    #[cfg(all(dev, mobile))]
+    let client = {
+      let mut builder = reqwest::ClientBuilder::new();
+
+      #[cfg(feature = "rustls-tls")]
+      if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+      }
+
+      if url.starts_with("https://") {
+        if let Some(cert_pem) = option_env!("TAURI_DEV_ROOT_CERTIFICATE") {
+          #[cfg(any(
+            feature = "native-tls",
+            feature = "native-tls-vendored",
+            feature = "rustls-tls"
+          ))]
+          {
+            log::info!("adding dev server root certificate");
+            let certificate = reqwest::Certificate::from_pem(cert_pem.as_bytes())
+              .expect("failed to parse TAURI_DEV_ROOT_CERTIFICATE");
+            builder = builder.tls_certs_merge([certificate]);
+          }
+
+          #[cfg(not(any(
+            feature = "native-tls",
+            feature = "native-tls-vendored",
+            feature = "rustls-tls"
+          )))]
+          {
+            log::warn!(
+              "the dev root-certificate-path option was provided, but you must enable one of the following Tauri features in Cargo.toml: native-tls, native-tls-vendored, rustls-tls"
+            );
+          }
+        } else {
+          log::warn!(
+            "loading HTTPS URL; you might need to provide a certificate via the `dev --root-certificate-path` option. You must enable one of the following Tauri features in Cargo.toml: native-tls, native-tls-vendored, rustls-tls"
+          );
+        }
+      }
+
+      builder
+        .pool_max_idle_per_host(6)
+        .build()
+        .unwrap()
     };
 
     Self {
@@ -86,6 +136,10 @@ where
       url,
       #[cfg(all(dev, mobile))]
       response_cache,
+      #[cfg(all(dev, mobile))]
+      client,
+      #[cfg(all(dev, mobile))]
+      semaphore: tokio::sync::Semaphore::new(6),
       runtime: PhantomData,
     }
   }
@@ -102,8 +156,15 @@ where
           url,
           #[cfg(all(dev, mobile))]
           response_cache,
+          #[cfg(all(dev, mobile))]
+          client,
+          #[cfg(all(dev, mobile))]
+          semaphore,
           ..
         } = &*this;
+
+        #[cfg(all(dev, mobile))]
+        let _permit = semaphore.acquire().await.unwrap();
 
         let resp_fut = get_response(
           request,
@@ -111,17 +172,25 @@ where
           window_origin.as_str(),
           web_resource_request_handler.as_deref(),
           #[cfg(all(dev, mobile))]
-          (url.as_str(), response_cache),
+          (url.as_str(), response_cache, client),
         );
 
-        match resp_fut.await {
-          Ok(response) => responder.respond(response),
-          Err(e) => responder.respond(
+        match tokio::time::timeout(Duration::from_secs(60), resp_fut).await {
+          Ok(Ok(response)) => responder.respond(response),
+          Ok(Err(e)) => responder.respond(
             HttpResponse::builder()
               .status(StatusCode::INTERNAL_SERVER_ERROR)
               .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
               .header("Access-Control-Allow-Origin", window_origin.as_str())
               .body(e.to_string().into_bytes())
+              .unwrap(),
+          ),
+          Err(_) => responder.respond(
+            HttpResponse::builder()
+              .status(StatusCode::GATEWAY_TIMEOUT)
+              .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
+              .header("Access-Control-Allow-Origin", window_origin.as_str())
+              .body("request to dev server timed out".as_bytes().to_vec())
               .unwrap(),
           ),
         }
@@ -135,7 +204,7 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
   #[allow(unused_variables)] manager: &M,
   window_origin: &str,
   web_resource_request_handler: Option<&WebResourceRequestHandler>,
-  #[cfg(all(dev, mobile))] (url, response_cache): (&str, &Mutex<HashMap<String, CachedResponse>>),
+  #[cfg(all(dev, mobile))] (url, response_cache, client): (&str, &Mutex<HashMap<String, CachedResponse>>, &reqwest::Client),
 ) -> Result<HttpResponse<Cow<'static, [u8]>>, Box<dyn std::error::Error>> {
   // use the entire URI as we are going to proxy the request
   let path = if PROXY_DEV_SERVER {
@@ -173,48 +242,7 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
       decoded_path.trim_start_matches('/')
     );
 
-    #[cfg(feature = "rustls-tls")]
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-      let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
-    let mut client = reqwest::ClientBuilder::new();
-
-    if url.starts_with("https://") {
-      // we can't load env vars at runtime, gotta embed them in the lib
-      if let Some(cert_pem) = option_env!("TAURI_DEV_ROOT_CERTIFICATE") {
-        #[cfg(any(
-          feature = "native-tls",
-          feature = "native-tls-vendored",
-          feature = "rustls-tls"
-        ))]
-        {
-          log::info!("adding dev server root certificate");
-          let certificate = reqwest::Certificate::from_pem(cert_pem.as_bytes())
-            .expect("failed to parse TAURI_DEV_ROOT_CERTIFICATE");
-          client = client.tls_certs_merge([certificate]);
-        }
-
-        #[cfg(not(any(
-          feature = "native-tls",
-          feature = "native-tls-vendored",
-          feature = "rustls-tls"
-        )))]
-        {
-          log::warn!(
-            "the dev root-certificate-path option was provided, but you must enable one of the following Tauri features in Cargo.toml: native-tls, native-tls-vendored, rustls-tls"
-          );
-        }
-      } else {
-        log::warn!(
-          "loading HTTPS URL; you might need to provide a certificate via the `dev --root-certificate-path` option. You must enable one of the following Tauri features in Cargo.toml: native-tls, native-tls-vendored, rustls-tls"
-        );
-      }
-    }
-
     let mut proxy_builder = client
-      .build()
-      .unwrap()
       .request(request.method().clone(), &url);
     proxy_builder = proxy_builder.body(std::mem::take(request.body_mut()));
     for (name, value) in request.headers() {
