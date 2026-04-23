@@ -6,7 +6,7 @@
 //! in production and proxying to the dev server on mobile during development.
 
 use http::{Request, Response as HttpResponse, StatusCode, header::CONTENT_TYPE};
-use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
+use std::{borrow::Cow, error::Error as StdError, marker::PhantomData, sync::Arc, time::Duration};
 use tauri_utils::config::HeaderAddition;
 
 use crate::{
@@ -250,17 +250,21 @@ async fn get_response<M: Manager<R> + Send + Sync + 'static, R: Runtime>(
           .body(response.body.to_vec().into())?
       }
       Err(e) => {
-        let error_message = format!(
-          "Failed to request {}: {}{}",
-          url.as_str(),
-          e,
-          if let Some(s) = e.status() {
-            format!("status code: {}", s.as_u16())
-          } else if cfg!(target_os = "ios") {
-            ", did you grant local network permissions? That is required to reach the development server. Please grant the permission via the prompt or in `Settings > Privacy & Security > Local Network` and restart the app. See https://support.apple.com/en-us/102229 for more information.".to_string()
-          } else {
-            "".to_string()
+        let is_connect = e.is_connect();
+        let is_timeout = e.is_timeout();
+        let is_request = e.is_request();
+        let source_chain = {
+          let mut chain = Vec::new();
+          let mut source: Option<&dyn StdError> = StdError::source(&e);
+          while let Some(s) = source {
+            chain.push(format!("{s}"));
+            source = s.source();
           }
+          chain.join(" -> ")
+        };
+        let error_message = format!(
+          "Failed to request {url}: {e} [connect={is_connect}, timeout={is_timeout}, request={is_request}, thread={:?}, sources: {source_chain}]",
+          std::thread::current().name(),
         );
         log::error!("{error_message}");
         return Err(error_message.into());
